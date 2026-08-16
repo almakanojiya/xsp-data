@@ -23,6 +23,14 @@ import statistics
 # whatever 0DTE is available each day, so pre-2022 is a Friday sample — still
 # covers the vol events we care about.
 #
+# v2 (2026-08-16) after the first run returned -86%: three fixes so the test is
+# FAIR — (1) combo LIMIT orders at mid, not market orders paying the full 4-leg
+# spread; (2) $100k start so one ~$1,000 condor is a small bet, no ruin spiral;
+# (3) restricted to May-2022+, the daily-0DTE era our live strategy actually
+# trades (pre-2022 was Friday-only weeklies, a different regime that ruined run 1
+# before it ever reached 2022). Read QC's own Win Rate / Net Profit as
+# authoritative; the SUMMARY log line reports placed/filled/win% too.
+#
 # HOW TO RUN (free QuantConnect account):
 #   1. quantconnect.com -> Create Algorithm -> paste this file
 #   2. Backtest. When done: Results -> export the trade log / statistics JSON
@@ -33,9 +41,15 @@ import statistics
 class SettlementCondor(QCAlgorithm):
 
     def initialize(self):
-        self.set_start_date(2012, 1, 1)
+        # FIX #3: restrict to the DAILY-0DTE era (SPXW daily expiries began
+        # May 2022). Pre-2022 only had Friday 0DTE — a different regime that
+        # ruined the first run before it ever reached the era we actually trade.
+        self.set_start_date(2022, 5, 1)
         self.set_end_date(2026, 8, 15)
-        self.set_cash(5000)
+        # FIX #2: $100k start so ONE SPX condor (~$1,000 max risk) is a small
+        # bet (~1%), not a 20% all-in that ruin-spirals as the account shrinks.
+        # Read PER-CONTRACT EV / win rate, not account %.
+        self.set_cash(100000)
         self.set_time_zone(TimeZones.NEW_YORK)
 
         self.spx = self.add_index("SPX").symbol
@@ -76,8 +90,9 @@ class SettlementCondor(QCAlgorithm):
         self.schedule.on(self.date_rules.every_day(self.spx),
                          self.time_rules.before_market_close(self.spx, 2), self.record_close)
 
-        self.trades = 0; self.wins = 0; self.ml = 0
-        self.set_warm_up(timedelta(days=30))
+        self.trades = 0; self.filled = 0; self.wins = 0; self.ml = 0
+        # no set_warm_up: the moves<15 guard below handles the fence ramp, and
+        # scheduled events don't reliably fire during LEAN warm-up.
 
     def on_data(self, slice):
         # keep the freshest 0DTE chain for use at 14:00
@@ -85,7 +100,6 @@ class SettlementCondor(QCAlgorithm):
         if ch: self.chain = ch
 
     def enter(self):
-        if self.is_warming_up: return
         today = self.time.strftime("%Y-%m-%d")
         if today in self.fomc:
             self.debug(f"{today} FOMC — skip"); return
@@ -117,10 +131,16 @@ class SettlementCondor(QCAlgorithm):
         if credit < gate:            self.debug(f"{today} thin {credit:.2f}<{gate:.2f}"); return
         if credit > 2.5 * fair:      self.debug(f"{today} rich {credit:.2f}>{2.5*fair:.2f}"); return
 
-        # sell the condor as a 4-leg combo, hold to PM cash settlement (no exit)
+        # FIX #1: combo LIMIT order at the mid credit — do NOT pay the full
+        # 4-leg spread with a market order (that alone flipped win-rate 77%->43%
+        # in the first run). A limit at mid models filling at fair value, which
+        # is how we'd actually work the order live. If it doesn't fill by the
+        # close it simply expires unfilled (no trade booked) — realistic.
         legs = [Leg.create(c_short.symbol, -1), Leg.create(c_long.symbol, 1),
                 Leg.create(p_short.symbol, -1), Leg.create(p_long.symbol, 1)]
-        self.combo_market_order(legs, 1)
+        # combo limit price is the NET the combo pays; we RECEIVE credit, so the
+        # limit is -credit (negative = net credit to us).
+        self.combo_limit_order(legs, 1, -round(credit, 2))
         self.strikes = (p_short.strike, c_short.strike, credit)
         self.trades += 1
         self.debug(f"{today} ENTER P{p_short.strike}/{c_short.strike}C credit {credit:.2f} fair {fair:.2f}")
@@ -129,7 +149,10 @@ class SettlementCondor(QCAlgorithm):
         if self.px2:
             close = self.securities[self.spx].price
             self.moves.append(abs(self.px2 - close))
-            if self.strikes:
+            # only count a trade if the limit actually FILLED (0DTE settles
+            # same day, so invested-at-close == today's condor filled)
+            if self.strikes and self.portfolio.invested:
+                self.filled += 1
                 pk, ck, credit = self.strikes
                 settle = min(max(pk - close, 0) + max(close - ck, 0), self.WING)
                 if credit > settle: self.wins += 1
@@ -154,6 +177,8 @@ class SettlementCondor(QCAlgorithm):
         return c.last_price if c.last_price else None
 
     def on_end_of_algorithm(self):
-        wr = 100 * self.wins / self.trades if self.trades else 0
-        self.log(f"SUMMARY trades={self.trades} wins={self.wins} ({wr:.0f}%) "
+        wr = 100 * self.wins / self.filled if self.filled else 0
+        fillrate = 100 * self.filled / self.trades if self.trades else 0
+        self.log(f"SUMMARY placed={self.trades} filled={self.filled} "
+                 f"(fill {fillrate:.0f}%) wins={self.wins} ({wr:.0f}%) "
                  f"max_losses={self.ml} final_equity={self.portfolio.total_portfolio_value:.0f}")
