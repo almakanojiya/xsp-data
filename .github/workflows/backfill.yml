@@ -1,0 +1,36 @@
+name: backfill
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 min, ALL hours ALL days — true 24/7.
+                             # Historical bars don't change, so no market gate.
+  workflow_dispatch: {}
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract
+        env:
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+        run: python3 backfill.py
+      - name: commit
+        run: |
+          git config user.name "xsp-harvester"
+          git config user.email "harvester@users.noreply.github.com"
+          if [ -n "$(git status --porcelain history/ state/)" ]; then
+            git add history/ state/
+            git commit -q -m "backfill $(date -u +%Y-%m-%dT%H:%MZ)"
+            for i in 1 2 3 4 5; do
+              git pull --rebase --autostash -q origin main && git push -q origin main && break
+              sleep $((RANDOM % 5 + 2))
+            done
+          else
+            echo "backfill caught up — nothing to commit"
+          fi
