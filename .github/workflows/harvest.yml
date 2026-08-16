@@ -1,0 +1,39 @@
+name: harvest
+on:
+  schedule:
+    # every 10 min across the UTC window that covers US market hours in both
+    # EDT (13:30-20:15 UTC) and EST (14:30-21:15 UTC). The script gates on
+    # actual ET market-open, so off-hours firings exit in seconds.
+    - cron: '*/10 13-21 * * 1-5'
+  workflow_dispatch: {}     # manual trigger for testing
+concurrency:
+  group: harvest            # never overlap runs
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: capture
+        env:
+          ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
+        run: python3 harvest.py
+      - name: commit
+        run: |
+          git config user.name "xsp-harvester"
+          git config user.email "harvester@users.noreply.github.com"
+          if [ -n "$(git status --porcelain data/)" ]; then
+            git add data/
+            git commit -q -m "harvest $(date -u +%Y-%m-%dT%H:%MZ)"
+            for i in 1 2 3 4 5; do
+              git pull --rebase --autostash -q origin main && git push -q origin main && break
+              sleep $((RANDOM % 5 + 2))
+            done
+          else
+            echo "no new data (market closed) — nothing to commit"
+          fi
