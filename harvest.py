@@ -80,27 +80,42 @@ def chain(exp,center):
         rw["a_bid"]=q.get("bp"); rw["a_ask"]=q.get("ap"); rw["a_print"]=tr.get("p")
     return rows
 
-def main():
+def snapshot():
     t=now_et()
-    if not market_open(t):
-        log(f"market closed ({t:%a %H:%M} ET) — idle"); return
-    if not TRADIER:
-        log("no TRADIER_TOKEN — abort"); sys.exit(1)
     sp=spot()
     # XSP tracks SPX/10 which is ~SPY, so XSP strike center ~ SPY_mid * ~1.003
     # (the validated per-day ratio band). NOT *0.1003 — XSP price ~= SPY price.
-    center=None
-    if sp.get("spy_mid"): center=round(sp["spy_mid"]*1.003)
-    exps=expirations()
+    center=round(sp["spy_mid"]*1.003) if sp.get("spy_mid") else None
     snap={"ts_et":t.isoformat(),"ts_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),
           "spot":sp,"center":center,"chains":{}}
-    for e in exps:
-        c=chain(e,center)
-        snap["chains"][e]=c
-        log(f"exp {e}: {len(c)} contracts near {center}")
+    for e in expirations():
+        snap["chains"][e]=chain(e,center)
     day=t.date().isoformat()
     os.makedirs("data",exist_ok=True)
+    n=sum(len(v) for v in snap["chains"].values())
     with open(f"data/{day}.jsonl","a") as fh: fh.write(json.dumps(snap)+"\n")
-    log(f"appended snapshot -> data/{day}.jsonl (spot_mid={sp.get('spy_mid')})")
+    log(f"{t:%H:%M:%S} snapshot: {n} contracts, spot_mid={sp.get('spy_mid')}")
+    return day
+
+def main():
+    # CONTINUOUS SESSION LOOP (repo is public -> unlimited Actions minutes).
+    # One job runs from open to close capturing every INTERVAL seconds, then
+    # exits at the bell. Cron restarts it each trading morning. If the market
+    # is closed when invoked, exit immediately (idempotent restart guard).
+    INTERVAL=60      # capture cadence (seconds) → true 1-minute quote history
+    MAX_RUN=540      # 9-min bounded chunk; a 10-min cron restarts it → seamless
+    if not TRADIER: log("no TRADIER_TOKEN — abort"); sys.exit(1)
+    if not market_open(now_et()):
+        log(f"market closed ({now_et():%a %H:%M} ET) — nothing to capture"); return
+    log(f"logger chunk up ({now_et():%H:%M} ET) — every {INTERVAL}s for {MAX_RUN}s")
+    t0=time.monotonic()
+    while market_open(now_et()) and time.monotonic()-t0<MAX_RUN:
+        loop0=time.monotonic()
+        try: snapshot()
+        except Exception as e: log(f"snapshot error (continuing): {e}")
+        dt=time.monotonic()-loop0
+        if time.monotonic()-t0+INTERVAL>=MAX_RUN: break
+        time.sleep(max(1,INTERVAL-dt))
+    log("chunk complete — exiting (cron restarts next chunk)")
 
 if __name__=="__main__": main()
